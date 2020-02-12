@@ -1,0 +1,567 @@
+load "iovtk";
+load "Element_Mixte";
+load "Element_PkEdge";
+//load "MUMPS_seq"; // Run using FreeFem++ example2_L.edp
+load "MUMPS";		// Run using ff-mpirun -np 1 example2_L.edp 
+include "adaptive-refinement.edp";
+
+bool adap = 1; // TURN OFF/ON ADAPTATIVITY
+int  nref = 6; // Number of mesh refinements
+
+string filename = "ex02"+adap+".m";
+
+real[int] errorL2s(nref); real[int] errorDivs(nref); real[int] errorHdivs(nref);
+real[int] errorL2u(nref); real[int] errorGradu(nref); real[int] errorH1u(nref);
+real[int] errorL2g(nref);
+real[int] errorL2phi(nref); real[int] errorGradphi(nref); real[int] errorH1phi(nref);
+real[int] errorL2lam(nref);
+real[int] errorL2pre(nref);
+real[int] errortotal(nref);
+
+real[int] rates(nref); rates[0] = 0.; 
+real[int] rateu(nref); rateu[0] = 0.;
+real[int] rateg(nref); rateg[0] = 0.;
+real[int] ratephi(nref); ratephi[0] = 0.;
+real[int] ratelam(nref); ratelam[0] = 0.;
+real[int] ratepre(nref); ratepre[0] = 0.;
+
+real[int] DOF(nref);
+real[int] iterations(nref);
+// A POSTERIORI
+real[int] eta(nref);
+real[int] eff(nref);
+real[int] rateest(nref);
+real[int] rateerror(nref); rateerror[0] = 0.;
+
+{ 
+	ofstream f(filename);
+	f << "data.DOF = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.errorHdivs = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.errorH1u = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.errorL2g = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.errorH1phi = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.errorL2lam = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.errorL2pre = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.rates = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.rateu = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.rateg = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.ratephi = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.ratelam = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.ratepre = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.iterations = zeros(" << 1 << "," << nref << ");\n";
+	// A Posteriori
+	f << "data.errortotal = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.rateerror = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.eta = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.eff = zeros(" << 1 << "," << nref << ");\n";
+	f << "data.rateest = zeros(" << 1 << "," << nref << ");\n";
+} // this bracket can be seen as a f.close();
+
+// L-shaped domain [-1,1]^2\[0,1]^2
+
+border b1(t=-1,1){x=t; y=-1; label=1;};
+border b2(t=-1,0){x=1; y=t; label=2;};
+border b3(t=1,0){x=t; y=0; label=3;};
+border b4(t=0,1){x=0; y=t; label=4;};
+border b5(t=0,-1){x=t; y=1; label=5;};
+border b6(t=1,-1){x=-1; y=t; label=6;};
+
+mesh Th;
+mesh Sh;
+real meas;
+
+for (int n = 0; n < nref; n++){
+
+	if (!adap || n == 0){
+		int size = 2^(n+3);
+		Th = buildmesh(b1(2*size)+b2(size)+b3(size)+b4(size)+b5(size)+b6(2*size));
+		mesh Shaux;
+		DualMeshConvex(Th,6,Shaux); // Creates mesh for Lambda
+		Sh = trunc(Shaux,x<=0 | y<=0);
+	}
+	//plot(Th,wait=0);
+	//plot(Sh,wait=1);
+
+	/*------------------------------------------
+		Finite Element Spaces
+	-------------------------------------------*/
+	fespace Hhs(Th,[RT0,RT0]); 	// Pseudostress
+	fespace Hhu(Th,[P1,P1]);	// Velocity
+	fespace Hhg(Th,P0); 		// Vorticity
+	fespace Hhp(Th,P1);			// Temperature
+	fespace Hhl(Sh,P0edge);		// Normal heat flux through the boundary
+
+	// A posteriori
+	fespace Ph(Th,P0);
+	fespace Vh(Th,P1);
+
+	macro w0 [w1,w2]//
+	Hhu w0;
+	Hhp phi0;
+
+	//***********************************************************************************************
+	//-----------------------------------------------------------------------------------------------
+
+	/*------------------------------------------
+		Known data
+	-------------------------------------------*/
+	real g1 = 0.0;
+	real g2 = 1.0;
+	func mu = phi0^(2.0/3.0); 		// Viscosity (phi0)
+	func muex = (exp(0.5*x*y*(x - 1)*(y - 1)))^(2.0/3.0);
+	real mu1 = 0.5; real mu2 = 4.0; 	// Bounds for the viscosity
+
+	func k11 = 1.0; 				// Thermal Conductivity Tensor
+	func k12 = 0.0;
+	func k22 = 1.0;
+
+	/*--------------------------------------------
+		Exact solutions and source terms
+	---------------------------------------------*/
+
+	func pnoex = 1/(x + 1.1);
+	meas = int2d(Th)(1.0);
+	real p0 = -1/meas*int2d(Th)(pnoex);
+	func pex = pnoex + p0; // Exact pressure
+
+	func uex1 = -(y - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^0.5; // Exact velocity
+	func uex2 = (x - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^0.5;
+	func duex1dx = 0.5*(y - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^1.5*(2.0*x - 0.2); // Gradients
+	func duex1dy = 0.5*(y - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^1.5*(2.0*y - 0.2) - 1.0/((x - 0.1)^2 + (y - 0.1)^2)^0.5;
+	func duex2dx = 1.0/((x - 0.1)^2 + (y - 0.1)^2)^0.5 - 0.5*(x - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^1.5*(2.0*x - 0.2);
+	func duex2dy = -0.5*(x - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^1.5*(2.0*y - 0.2);
+
+	func phiex = exp(0.5*x*y*(x - 1)*(y - 1)); // Exact temperature
+	func dphiexdx = exp(0.5*x*y*(x - 1)*(y - 1))*(0.5*x*y*(y - 1) + 0.5*y*(x - 1)*(y - 1)); // Gradients
+	func dphiexdy = exp(0.5*x*y*(x - 1)*(y - 1))*(0.5*x*y*(x - 1) + 0.5*x*(x - 1)*(y - 1));
+	
+	//Hhp polypex = pex;
+	//plot(polypex,wait=1,fill=1,nbiso=40,value=1); // Plot exact pressure (interpolated)
+
+	func fm1 = 0.3333333333*exp(0.5*x*y*(x - 1)*(y - 1))/exp(0.5*x*y*(x - 1)*(y - 1))^0.3333333333*(0.5*(x 
+		- 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^1.5*(2.0*x - 0.2) - 0.5*(y - 0.1)/((x - 0.1)^2 + (y 
+		- 0.1)^2)^1.5*(2.0*y - 0.2))*(0.5*x*y*(x - 1) + 0.5*x*(x - 1)*(y - 1)) - 1.0/(x + 1.1)^2 
+		- 0.5*exp(0.5*x*y*(x - 1)*(y - 1))^0.6666666667*(0.5/((x - 0.1)^2 + (y - 0.1)^2)^1.5*(2.0*y - 0.2) 
+		+ 1.0*(y - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^1.5 - 0.75*(y - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^2.5*(2.0*y 
+		- 0.2)^2 + 0.75*(x - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^2.5*(2.0*x - 0.2)*(2.0*y - 0.2)) - 0.5*(y 
+		- 0.1)^2/((x - 0.1)^2 + (y - 0.1)^2)^2.0*(2.0*x - 0.2) - (x - 0.1)*(1.0/((x - 0.1)^2 + (y - 0.1)^2)^0.5 
+		- 0.5*(y - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^1.5*(2.0*y - 0.2))/((x - 0.1)^2 + (y - 0.1)^2)^0.5 
+		- 1.0*exp(0.5*x*y*(x - 1)*(y - 1))^0.6666666667*(y - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^1.5 
+		- g1*exp(0.5*x*y*(x - 1)*(y - 1)) + 0.75*exp(0.5*x*y*(x - 1)*(y - 1))^0.6666666667*(y - 0.1)/((x 
+		- 0.1)^2 + (y - 0.1)^2)^2.5*(2.0*x - 0.2)^2 - 0.3333333333*exp(0.5*x*y*(x - 1)*(y - 1))/exp(0.5*x*y*(x 
+		- 1)*(y - 1))^0.3333333333*(y - 0.1)*(0.5*x*y*(y - 1) + 0.5*y*(x - 1)*(y - 1))/((x - 0.1)^2 + (y 
+		- 0.1)^2)^1.5*(2.0*x - 0.2); // Source term
+
+	func fm2 = 0.5*exp(0.5*x*y*(x - 1)*(y - 1))^0.6666666667*(0.5/((x - 0.1)^2 + (y - 0.1)^2)^1.5*(2.0*x - 0.2) 
+		+ 1.0*(x - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^1.5 - 0.75*(x - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^2.5*(2.0*x 
+		- 0.2)^2 + 0.75*(y - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^2.5*(2.0*x - 0.2)*(2.0*y - 0.2)) 
+		- g2*exp(0.5*x*y*(x - 1)*(y - 1)) - 0.5*(x - 0.1)^2/((x - 0.1)^2 + (y - 0.1)^2)^2.0*(2.0*y - 0.2) 
+		- (y - 0.1)*(1.0/((x - 0.1)^2 + (y - 0.1)^2)^0.5 - 0.5*(x - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^1.5*(2.0*x 
+		- 0.2))/((x - 0.1)^2 + (y - 0.1)^2)^0.5 + 1.0*exp(0.5*x*y*(x - 1)*(y - 1))^0.6666666667*(x - 0.1)/((x 
+		- 0.1)^2 + (y - 0.1)^2)^1.5 + 0.3333333333*exp(0.5*x*y*(x - 1)*(y - 1))/exp(0.5*x*y*(x 
+		- 1)*(y - 1))^0.3333333333*(0.5*(x - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^1.5*(2.0*x - 0.2) 
+		- 0.5*(y - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^1.5*(2.0*y - 0.2))*(0.5*x*y*(y - 1) + 0.5*y*(x - 1)*(y - 1)) 
+		- 0.75*exp(0.5*x*y*(x - 1)*(y - 1))^0.6666666667*(x - 0.1)/((x - 0.1)^2 + (y - 0.1)^2)^2.5*(2.0*y - 0.2)^2 
+		+ 0.3333333333*exp(0.5*x*y*(x - 1)*(y - 1))/exp(0.5*x*y*(x - 1)*(y - 1))^0.3333333333*(x - 0.1)*(0.5*x*y*(x 
+		- 1) + 0.5*x*(x - 1)*(y - 1))/((x - 0.1)^2 + (y - 0.1)^2)^1.5*(2.0*y - 0.2); // Source term
+
+	func fe = exp(0.5*x*y*(x - 1)*(y - 1))*(x - 0.1)*(0.5*x*y*(x - 1) + 0.5*x*(x - 1)*(y - 1))/((x - 0.1)^2 
+		+ (y - 0.1)^2)^0.5 - 1.0*exp(0.5*x*y*(x - 1)*(y - 1))*(0.5*x*y*(y - 1) + 0.5*y*(x - 1)*(y - 1))^2 
+		- 1.0*x*exp(0.5*x*y*(x - 1)*(y - 1))*(x - 1) - 1.0*y*exp(0.5*x*y*(x - 1)*(y - 1))*(y - 1) 
+		- 1.0*exp(0.5*x*y*(x - 1)*(y - 1))*(0.5*x*y*(x - 1) + 0.5*x*(x - 1)*(y - 1))^2 - exp(0.5*x*y*(x - 1)*(y 
+		- 1))*(y - 0.1)*(0.5*x*y*(y - 1) + 0.5*y*(x - 1)*(y - 1))/((x - 0.1)^2 + (y - 0.1)^2)^0.5; // Source term
+
+	//-----------------------------------------------------------------------------------------------
+	//***********************************************************************************************
+
+	// Stabilization parameters
+	real kappa1 = mu1^2/mu2;
+	real kappa2 = 1./mu2;
+	real kappa0 = 1.; 				// Heuristic choice
+	real kappa3 = kappa0*mu1^2/(2.*mu2);
+	real kappa4 = mu1^2/(2*mu2);
+
+	/*-----------------------------------------------------------
+		Macros for unknowns, test functions and parameters
+	------------------------------------------------------------*/
+	macro fm [fm1,fm2]//
+	macro g [g1,g2]//
+	macro S [s11,s12,s21,s22]//
+	macro u [u1,u2]//
+	macro G [gam]//
+	macro T [t11,t12,t21,t22]//
+	macro v [v1,v2]//
+	macro E [eta] // there's only one degree of freedom
+	macro tr(S) (S[0]+S[3])//
+	macro dev(S) [S[0]-0.5*(S[0]+S[3]),S[1],S[2],S[3]-0.5*(S[0]+S[3])] //
+	macro grad(r) [dx(r),dy(r)]//
+	macro Grad(v) [dx(v[0]),dy(v[0]),dx(v[1]),dy(v[1])]//
+	macro div(v) (dx(v[0])+dy(v[1])) //
+	macro Div(S) [dx(S[0])+dy(S[1]),dx(S[2])+dy(S[3])] //
+	macro conv(u,w) [u[0]*w[0]-0.5*(u[0]*w[0]+u[1]*w[1]),
+					 u[0]*w[1],u[1]*w[0],
+					 u[1]*w[1]-0.5*(u[0]*w[0]+u[1]*w[1])]//  //(u \otimes w)^\dev
+	macro Str(v) [dx(v[0]),0.5*(dy(v[0])+ dx(v[1])),0.5*(dy(v[0])+ dx(v[1])),dy(v[1])]//
+	macro Vor(v) [0.*v[0],0.5*(dy(v[0])-dx(v[1])),-(dy(v[0])-dx(v[1]))/2.0,0.*v[0]]//
+	macro rot(v) (dx(v[1])-dy(v[0]))//
+
+	/*----------------------------------------------------
+		Bilinear Forms and Right-Hand Sides
+	-----------------------------------------------------*/
+
+	// Momentum Equation
+	varf A1(S,T) = int2d(Th)(mu^(-1)*dev(S)'*T + kappa2*Div(S)'*Div(T));
+	varf A2(S,v) = int2d(Th)(-kappa1*mu^(-1)*dev(S)'*Str(v)-v'*Div(S)); 
+	varf A3(S,E) = -int2d(Th)(E[0]*(S[2]-S[1]));
+	varf A4(u,T) = int2d(Th)(u'*Div(T) + mu^(-1)*conv(u,w0)'*T);
+	varf A5(u,v) = int2d(Th)(kappa1*Str(u)'*Str(v) - kappa1*mu^(-1)*conv(u,w0)'*Str(v)) 
+					+ int1d(Th,1,2,3,4,5,6)(kappa4*u'*v);
+	varf A6(u,E) = int2d(Th)(-kappa3*E[0]*rot(u));
+	varf A7(G,T) = int2d(Th)(G[0]*(T[2]-T[1]));
+	varf A8(G,E) = int2d(Th)(kappa3*2.*G[0]*E[0]);
+	varf A9([unused],S)=int2d(Th)(tr(S));
+
+	varf RHSM1([unused],T) = int1d(Th,1,2,3,4,5,6)(uex1*(T[0]*N.x+T[1]*N.y) + uex2*(T[2]*N.x+T[3]*N.y))
+								- int2d(Th)(kappa2*phi0*g'*Div(T)) - int2d(Th)(kappa2*fm'*Div(T));
+	varf RHSM2([unused],v) = int1d(Th,1,2,3,4,5,6)(kappa4*(uex1*v[0]+uex2*v[1])) + int2d(Th)(phi0*g'*v)
+								+ int2d(Th)(fm'*v);
+
+	// Energy Equation
+	varf a(phi,psi) = int2d(Th)([k11*dx(phi)+k12*dy(phi),k12*dx(phi)+k22*dy(phi)]'*grad(psi));
+	varf b(psi,lam) = int1d(Th,1,2,3,4,5,6)(lam*psi);
+	// Penalization for the interior edges of Sh
+	varf c(lam,xi) = intalledges(Sh)(1E-12*(1-nTonEdge)*lam*xi);
+
+	varf RHSE1(unused,psi) = -int2d(Th)(psi*w0'*grad(phi0)) + int2d(Th)(fe*psi); 
+	varf RHSE2(unused,xi) = int1d(Th,1,2,3,4,5,6)(phiex*xi); // bilinear forms A(vector,scalar) not allowed
+
+	/*--------------------------------------------
+		Stiffness Matrices and Load Vectors
+	---------------------------------------------*/
+
+	// Global Matrices for the Momentum Equation
+	matrix MA3 = A3(Hhs,Hhg);
+	matrix MA6 = A6(Hhu,Hhg);
+	matrix MA7 = A7(Hhg,Hhs);
+	matrix MA8 = A8(Hhg,Hhg);
+	real[int] MA9 = A9(0,Hhs); // not a "matrix", but a "vector"
+
+	// Global Matrix Energy Equation
+	matrix Ma = a(Hhp,Hhp);
+	matrix Mb = b(Hhp,Hhl);
+	matrix Mc = c(Hhl,Hhl);
+
+	matrix Me = [[Ma, Mb'], 
+				 [Mb, Mc ]];
+
+	/*---------------------------------------------
+		Picard iteration preliminaries
+	----------------------------------------------*/
+	w0 = [1.,1.];
+	phi0 = 1.0;
+
+	real[int] sol(Hhs.ndof+Hhu.ndof+Hhg.ndof+Hhp.ndof+Hhl.ndof+1);
+	sol = 0;
+
+	int iter = 0;
+	real tol = 10000.; // tol = Inf
+
+	/*--------------------------------------------
+		Picard's Fixed-Point Algorithm
+	---------------------------------------------*/
+	while((tol > 1e-8) && (iter < 100)){
+
+		// (w,phi)-dependent local matrices
+		matrix MA1 = A1(Hhs,Hhs);
+		matrix MA2 = A2(Hhs,Hhu);
+		matrix MA4 = A4(Hhu,Hhs);
+		matrix MA5 = A5(Hhu,Hhu);
+
+		matrix Mm = [[MA1, MA4, MA7, MA9],
+					 [MA2, MA5, 0,   0  ],
+					 [MA3, MA6, MA8, 0  ],
+					 [MA9',  0, 0,   0  ]];
+
+		// (w,phi)-dependent load vector for the Momentum Equation
+		real[int] Lm(Hhs.ndof+Hhu.ndof+Hhg.ndof+1);
+		Lm = 0;
+		Lm(0:Hhs.ndof-1) = RHSM1(0,Hhs);
+		Lm(Hhs.ndof:Hhs.ndof+Hhu.ndof-1) = RHSM2(0,Hhu);
+
+		// Solving Momentum Equation
+		set(Mm,solver = sparsesolver);
+		real[int] solm = Mm^-1*Lm;
+
+		// Setting a new w0
+		Hhu [zh1,zh2] = [0.,0.];
+		zh1[] = solm(Hhs.ndof:Hhs.ndof+Hhu.ndof-1);
+		w0 = [zh1,zh2];
+
+		// (w,phi)-dependent load vector for the Energy Equation
+		real[int] Le(Hhp.ndof+Hhl.ndof);
+		Le = 0;
+		Le(0:Hhp.ndof-1) = RHSE1(0,Hhp);
+		Le(Hhp.ndof:Hhp.ndof+Hhl.ndof-1) = RHSE2(0,Hhl);
+
+		// Solving Energy Equation
+		set(Me,solver = sparsesolver);
+		real[int] sole = Me^-1*Le;
+
+		// Setting a new phi0
+		Hhp phi1 = 0;
+		phi1[] = sole(0:Hhp.ndof-1);
+		phi0 = phi1;
+
+		// Assembling the global solution
+		real[int] solnew(Hhs.ndof+Hhu.ndof+Hhg.ndof+Hhp.ndof+Hhl.ndof+1);
+		solnew = 0;
+		solnew(0:Hhs.ndof+Hhu.ndof+Hhg.ndof) = solm;
+		solnew(Hhs.ndof+Hhu.ndof+Hhg.ndof+1:Hhs.ndof+Hhu.ndof+Hhg.ndof+Hhp.ndof+Hhl.ndof) = sole;
+
+		// Verifying stopping criteria
+		real[int] diff = sol-solnew;
+		tol = sqrt(diff'*diff)/sqrt(solnew'*solnew);
+		++iter;
+		sol = solnew;
+
+		// Displaying information on the iteration
+		cout << "nref = " << n << "    Iteration: " << iter << "    Rel. Error: " << tol << endl;
+		cout << "solm.max = " << solm.max << endl;
+		cout << "solm.min = " << solm.min << endl;
+		cout << "sole.max = " << sole.max << endl;
+		cout << "sole.min = " << sole.min << endl;
+	}
+
+	DOF[n] = Hhs.ndof+Hhu.ndof+Hhg.ndof+Hhp.ndof+Hhl.ndof+1;
+	iterations[n] = iter;
+
+	Hhs [sigh11,sigh12,sigh21,sigh22] = [0,0,0,0];
+	sigh11[] = sol(0:Hhs.ndof-1); 
+
+	Hhu [uh1,uh2] = [0,0];
+	uh1[] = sol(Hhs.ndof:Hhs.ndof+Hhu.ndof-1);
+
+	Hhg gamh = 0;
+	gamh[] = sol(Hhs.ndof+Hhu.ndof:Hhs.ndof+Hhu.ndof+Hhg.ndof-1);
+
+	Hhp phih = 0;
+	phih[] = sol(Hhs.ndof+Hhu.ndof+Hhg.ndof+1:Hhs.ndof+Hhu.ndof+Hhg.ndof+Hhp.ndof);
+
+	Hhl lamh = 0;
+	lamh[] = sol(Hhs.ndof+Hhu.ndof+Hhg.ndof+Hhp.ndof+1:Hhs.ndof+Hhu.ndof+Hhg.ndof+Hhp.ndof+Hhl.ndof);
+
+	real ch = int2d(Th)((uh1^2+uh2^2)/(2.*meas)); //cT
+
+	Hhg ph = -0.5*(sigh11 + uh1^2 + sigh22 + uh2^2 - 2.*ch); // Piecewise constant
+
+	/*------------------------------------------------
+		Remaining exact solutions to calculate
+	-------------------------------------------------*/
+
+	real cc = int2d(Th)((uex1^2+uex2^2)/(2.*meas)); //cTex
+
+	func sig11 = muex*duex1dx - pex - uex1^2 + cc;
+	func sig12 = 0.5*muex*(duex1dy+duex2dx) - uex1*uex2;
+	func sig21 = sig12;
+	func sig22 = muex*duex2dy - pex - uex2^2 + cc;
+
+	func divs1 = - fm1 - phiex*g1;
+	func divs2 = - fm2 - phiex*g2;
+
+	func gam = 0.5*(duex2dx-duex1dy);
+
+	//Hhl lam = ... Lambda will be calculated inside the integral
+
+	/*---------------------------------------------
+		ERRORS AND RATES OF CONVERGENCE
+	----------------------------------------------*/
+
+	errorL2s[n] = int2d(Th)((sig11-sigh11)^2+(sig12-sigh12)^2+(sig21-sigh21)^2+(sig22-sigh22)^2);
+	errorDivs[n] = int2d(Th)((divs1-dx(sigh11)-dy(sigh12))^2 + (divs2-dx(sigh21)-dy(sigh22))^2);
+	errorHdivs[n] = sqrt(errorL2s[n] + errorDivs[n]);
+
+	errorL2u[n] = int2d(Th)((uex1-uh1)^2+(uex2-uh2)^2);
+	errorGradu[n] = int2d(Th)((duex1dx-dx(uh1))^2 + (duex1dy-dy(uh1))^2 
+								+ (duex2dx-dx(uh2))^2 + (duex2dy-dy(uh2))^2);
+	errorH1u[n] = sqrt(errorL2u[n] + errorGradu[n]);
+
+	errorL2g[n] = sqrt(int2d(Th)(2*(gam-gamh)^2));
+
+	errorL2phi[n] = int2d(Th)((phiex-phih)^2);
+	errorGradphi[n] = int2d(Th)((dphiexdx-dx(phih))^2 + (dphiexdy-dy(phih))^2);
+	errorH1phi[n] = sqrt(errorL2phi[n] + errorGradphi[n]);
+
+	errorL2lam[n] = sqrt( int1d(Th,1,2,3,4,5,6)((lamh + (k11*dphiexdx+k12*dphiexdy)*N.x 
+											+ (k12*dphiexdx + k22*dphiexdy)*N.y)^2 ) );
+
+	errortotal[n] = sqrt(errorHdivs[n]^2 + errorH1u[n]^2 + errorL2g[n]^2 
+							+ errorH1phi[n]^2 + errorL2lam[n]^2);
+
+	errorL2pre[n] = sqrt( int2d(Th)((pex-ph)^2) );
+
+	if (n > 0){
+		rates[n] = -2*log(errorHdivs[n-1]/errorHdivs[n])/log(DOF[n-1]/DOF[n]);
+		rateu[n] = -2*log(errorH1u[n-1]/errorH1u[n])/log(DOF[n-1]/DOF[n]);
+		rateg[n] = -2*log(errorL2g[n-1]/errorL2g[n])/log(DOF[n-1]/DOF[n]);
+		ratephi[n] = -2*log(errorH1phi[n-1]/errorH1phi[n])/log(DOF[n-1]/DOF[n]);
+		ratelam[n] = -2*log(errorL2lam[n-1]/errorL2lam[n])/log(DOF[n-1]/DOF[n]);
+		ratepre[n] = -2*log(errorL2pre[n-1]/errorL2pre[n])/log(DOF[n-1]/DOF[n]);
+	}
+
+	/*-----------------------------------------
+		WRITING TO FILE
+	------------------------------------------*/
+
+	{
+		ofstream f(filename,append);
+		f.scientific << "data.DOF(" << n+1 << ") = " << DOF[n] << ";\n";
+		f.scientific << "data.errorHdivs(" << n+1 << ") = " << errorHdivs[n] << ";\n";
+		f.scientific << "data.errorH1u(" << n+1 << ") = " << errorH1u[n] << ";\n";
+		f.scientific << "data.errorL2g(" << n+1 << ") = " << errorL2g[n] << ";\n";
+		f.scientific << "data.errorH1phi(" << n+1 << ") = " << errorH1phi[n] << ";\n";
+		f.scientific << "data.errorL2lam(" << n+1 << ") = " << errorL2lam[n] << ";\n";
+		f.scientific << "data.errorL2pre(" << n+1 << ") = " << errorL2pre[n] << ";\n";
+		f.scientific << "data.rates(" << n+1 << ") = " << rates[n] << ";\n";
+		f.scientific << "data.rateu(" << n+1 << ") = " << rateu[n] << ";\n";
+		f.scientific << "data.rateg(" << n+1 << ") = " << rateg[n] << ";\n";
+		f.scientific << "data.ratephi(" << n+1 << ") = " << ratephi[n] << ";\n";
+		f.scientific << "data.ratelam(" << n+1 << ") = " << ratelam[n] << ";\n";
+		f.scientific << "data.ratepre(" << n+1 << ") = " << ratepre[n] << ";\n";
+		f.scientific << "data.iterations(" << n+1 << ") = " << iterations[n] << ";\n";
+	}
+
+	/*-----------------------------------------
+		A POSTERIORI
+	------------------------------------------*/
+	
+	macro curl(S) [dx(S[1])-dy(S[0]),dx(S[3])-dy(S[2])]//
+	macro tanv [-N.y,N.x]//
+	macro sight [sigh11,sigh12,sigh21,sigh22]//
+	macro trans(S) [S[0],S[2],S[1],S[3]]//
+	macro uh [uh1,uh2]//
+	macro gamht [0,-gamh,gamh,0]//
+	macro uhuh [square(uh1),uh1*uh2,uh2*uh1,square(uh2)]//
+
+	func muh = phih^(2.0/3.0); 			// DATA-DEPENDENT
+	func muhder = (2.0/3.0)*phih^(-1.0/3.0); 	// DATA-DEPENDENT
+
+	func theta1 = Str(uh)-muh^(-1)*(dev(uhuh)+dev(sight));
+	func theta2 = sight-trans(sight);
+	func theta3 = gamht-Vor(uh);
+	func theta4 = Div(sight)+phih*g+fm;
+	//
+	func curluhuh = [uh1*dx(uh2)+uh2*dx(uh1)-2*uh1*dy(uh1),
+					 2*uh2*dx(uh2)-uh1*dy(uh2)-uh2*dy(uh1)];
+	func curltr = [-dy(sigh11)-dy(sigh22)-2*uh1*dy(uh1)-2*uh2*dy(uh2),
+					dx(sigh11)+dx(sigh22)+2*uh1*dx(uh1)+2*uh2*dx(uh2)];
+	func devterm = dev(sight)+dev(uhuh);
+	func theta5 = (-1.0)*grad(gamh) + muh^(-1)*(curluhuh+curl(sight))-0.5*muh^(-1)*curltr
+		-(muhder/(muh^2))*[-devterm[0]*dy(phih)+devterm[1]*dx(phih),-devterm[2]*dy(phih)+devterm[3]*dx(phih)]; 
+	//
+	func dk11dx = 0.0; 						// DATA-DEPENDENT
+	func dk12dy = 0.0;
+	func dk12dx = 0.0;
+	func dk22dy = 0.0; 						// DATA-DEPENDENT
+	func divK = [dk11dx+dk12dy,dk12dx+dk22dy];
+	Hhp dxphih = dx(phih);
+	Hhp dyphih = dy(phih);
+	func hessphih = [dx(dxphih),dx(dyphih),dy(dxphih),dy(dyphih)];
+	func fullK = [k11,k12,k12,k22];
+	func divkphih = divK'*grad(phih) + fullK'*hessphih;
+	func theta6 = divkphih - uh'*grad(phih)+fe;
+	//
+	func tensor = gamht + muh^(-1)*(dev(uhuh)+dev(sight));
+	func theta7 = square(jump([tensor[0],tensor[1]]'*tanv)) + square(jump([tensor[2],tensor[3]]'*tanv));
+	//
+	func kphih0 = k11*dx(phih)+k12*dy(phih);
+	func kphih1 = k12*dx(phih)+k22*dy(phih);
+	func theta8 = square(jump(kphih0*N.x+kphih1*N.y));
+	//
+	func theta9 = [-(tensor[0]-duex1dx)*N.y+(tensor[1]-duex1dy)*N.x,
+ 				   -(tensor[2]-duex2dx)*N.y+(tensor[3]-duex2dy)*N.x];
+ 	func theta10 = lamh + kphih0*N.x+kphih1*N.y;
+ 	func theta11 = [uex1-uh1,uex2-uh2];
+ 	func theta12 = phih-phiex;
+ 	func theta13 = [dphiexdx-dx(phih),dphiexdy-dy(phih)];
+
+ 	varf estimator(unused,chiK) =  int2d(Th)(chiK*theta1'*theta1)
+		+ int2d(Th)(chiK*theta2'*theta2)
+		+ int2d(Th)(chiK*theta3'*theta3)
+		+ int2d(Th)(chiK*theta4'*theta4) 
+		+ int2d(Th)(chiK*square(hTriangle)*theta5'*theta5)
+		+ int2d(Th)(chiK*square(hTriangle)*square(theta6)) 
+		+ intalledges(Th)((nTonEdge-1.)*chiK*lenEdge*(theta7 + theta8))
+		+ int1d(Th,1,2,3,4,5,6)(chiK*lenEdge*theta9'*theta9)
+		+ int1d(Th,1,2,3,4,5,6)(chiK*lenEdge*square(theta10))
+		+ int1d(Th,1,2,3,4,5,6)(chiK*theta11'*theta11)
+		+ int1d(Th,1,2,3,4,5,6)(chiK*square(theta12)) 
+		+ int1d(Th,1,2,3,4,5,6)(chiK*theta13'*theta13);
+
+	Ph etak;
+	etak[] = estimator(0,Ph);
+	eta[n] = sqrt(etak[].sum);
+	eff[n] = errortotal[n]/eta[n];
+
+	if (n>0){
+		rateest[n] = -2.0*log(eta[n-1]/eta[n])/log(DOF[n-1]/DOF[n]);
+		rateerror[n] = -2.0*log(errortotal[n-1]/errortotal[n])/log(DOF[n-1]/DOF[n]);
+	}
+
+	{
+		ofstream f(filename,append);
+		f.scientific << "data.errortotal(" << n+1 << ") = " << errortotal[n] << ";\n";
+		f.scientific << "data.eta(" << n+1 << ") = " << eta[n] << ";\n";
+		f.scientific << "data.eff(" << n+1 << ") = " << eff[n] << ";\n";
+		f.scientific << "data.rateest(" << n+1 << ") = " << rateest[n] << ";\n";
+		f.scientific << "data.rateerror(" << n+1 << ") = " << rateerror[n] << ";\n";
+	}
+
+	//plot(uh1,fill=1,nbiso=40,value=1,wait=0);
+	
+
+	/*-----------------------------------------
+		EXPORTING GRAPHICS
+	------------------------------------------*/
+	Hhg realgamh = 2.0*gamh;
+	savevtk("ex02_"+adap+n+".vtk",Th,sigh11,sigh12,sigh21,sigh22,[uh1,uh2,0],ph,realgamh,phih,
+			dataname="sigh11 sigh12 sigh21 sigh22 uh ph realgamh phih");
+	cout << "ex02_"+adap+n+".vtk saved" << endl;
+	savevtk("ex02_exact_"+adap+n+".vtk",Th,sig11,sig12,sig21,sig22,[uex1,uex2,0],pex,gam,phiex,
+			dataname="sig11 sig12 sig21 sig22 u p realgam phi");
+	cout << "ex02_exact_"+adap+n+".vtk saved" << endl;
+
+	//Hhp velmag = sqrt(uh1^2+uh2^2);
+
+	if (adap & n < nref-1){
+		real cc1=0.8;
+		Refinement(Th,Ph,Vh,estimator,cc1);
+		mesh Shaux;
+		DualMeshConvex(Th,6,Shaux);
+		Sh = trunc(Shaux,x<=0 | y<=0);
+	}
+
+}
+
+/*---------------------------------
+	RESULTS TO TERMINAL
+----------------------------------*/
+
+cout << "------------------ S U M M A R Y   O F   R E S U L T S ------------------" << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "DOF = " << DOF[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "errorHdivs = " << errorHdivs[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "rates = " << rates[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "errorH1u = " << errorH1u[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "rateu = " << rateu[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "errorL2g = " << errorL2g[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "rateg = " << rateg[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "errorH1phi = " << errorH1phi[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "ratephi = " << ratephi[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "errorL2lam = " << errorL2lam[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "ratelam = " << ratelam[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "errorL2pre = " << errorL2pre[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "ratepre = " << ratepre[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "errortotal = " << errortotal[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "rateerror = " << rateerror[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "eta = " << eta[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "effectivity = " << eff[n] << endl;
+for (int n=0; n < nref; n++) cout << "(" << n << ") " << "rateest = " << rateest[n] << endl;

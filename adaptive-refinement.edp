@@ -1,0 +1,98 @@
+// macro the get the current mesh size parameter 
+// in:  Th the mesh
+//      Vh P1 fespace on Th
+// out: h the Vh finite element finite set to the current mesh size 
+macro  MeshSizecomputation(Th,Vh,h){  
+	/* Th mesh, Vh  P1 finite element space, h the P1 mesh size value */
+	real[int]  count(Th.nv);
+	
+	/* mesh size  (lenEdge = $\int_e 1$)  */
+	varf vmeshsizen(unused,vv) = intalledges(Th,qfnbpE=1)(vv); 
+	
+	/* number of edge / par vertex */ 
+	varf vedgecount(unused,vv)=intalledges(Th,qfnbpE=1)(vv/lenEdge); 
+	
+   /* computation of the mesh size */ 
+	count = vedgecount(0,Vh);
+	h[] = 0.;
+	h[] = vmeshsizen(0,Vh);
+	h[] = h[]./count;
+} // end of macro MeshSizecomputation
+
+/* macro to remesh according the de residual indicator 
+     in: 
+     Th the mesh
+     Ph  P0 fespace on Th
+     Vh  P1 fespace on Th
+     vindicator the varf of to evaluate the indicator to ^2
+     coef on etameam ..
+ -----
+	Vh h = 0.;
+  	Vh hm = 0.;
+	evalutate the mesh size  */
+macro  Refinement(Th,Ph,Vh,vindicator,coef){
+	Vh h = 0.;
+	MeshSizecomputation(Th,Vh,h); 
+	Ph etak;  
+	etak[] = vindicator(0,Ph);
+	etak[] = sqrt(etak[]); 
+	real etastar = coef*(etak[].sum/etak[].n);
+	/*real etastar = coef*(etak[].max);*/
+
+	/* here etaK is discontinous we use the P1 L2 projection with mass lumping . */	
+	Vh fn, sn;
+	varf veta(unused,vv) = int2d(Th)(etak*vv);
+	varf vun(unused,vv)  = int2d(Th)(1*vv);
+	fn[]    = veta(0,Vh);
+	sn[] = vun(0,Vh);
+	fn[] = fn[]./ sn[];
+	/*fn   = max(min(fn/etastar,3.),0.3333);*/
+	fn   = min(max(fn/etastar,1.),3.);
+ 
+	
+	/* new mesh size */ 
+	h  = h / fn ; 
+
+	Th = adaptmesh(Th,IsMetric=1,h,splitpbedge=1,nbvx=500000);
+} // end of macro ReMeshIndicator
+
+macro DualMeshConvex(Th,nlabels,Sh){
+	real[int] nbes(nlabels); /* number of boundary segments per label*/
+	int CurrentLabel, OldLabel;
+	nbes = 0;
+
+	OldLabel = Th.be(0).label;
+	int i1 = 0;
+	for (int i = 0; i < Th.nbe; i++){
+		CurrentLabel = Th.be(i).label;
+		if (CurrentLabel != OldLabel){
+			i1++;
+			OldLabel = CurrentLabel;
+		}
+		nbes[CurrentLabel-1] = nbes[CurrentLabel-1]+1;
+	}
+
+	/* 	If I change to a label with an even number of edges,
+		the first one must be triple */
+
+	OldLabel = Th.be(0).label;
+	bool ChangeFirst = 1;
+	for (int i=0; i<Th.nbe; i += 2){
+		CurrentLabel = Th.be(i).label;
+		{
+			ofstream f("PointsDualMesh.xyz",append);
+			f.scientific << Th.be(i)[0].x << " " << Th.be(i)[0].y << "\n";
+		}
+		if (OldLabel != CurrentLabel){
+			ChangeFirst = 1;
+			OldLabel = CurrentLabel;
+		}
+		if (nbes[CurrentLabel-1]%2 & ChangeFirst){
+			i++;
+			ChangeFirst = 0;
+		}
+	}
+
+	Sh = triangulate("PointsDualMesh.xyz");
+	system("rm PointsDualMesh.xyz");
+}// 
