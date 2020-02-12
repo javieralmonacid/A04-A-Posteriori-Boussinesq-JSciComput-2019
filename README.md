@@ -1,4 +1,4 @@
-Adaptive Refinement for Natural Convection problems.
+Adaptive Refinement for Natural Convection problems
 =================================================
 
 Natural convection is a heat transfer process that is present in our everyday life: from the cooling of little electronic devices, to indoor climate systems, to environmental transport problems. In this set of codes, we implement an "a posteriori" error estimator for the finite element method implemented in [A01-MixedPrimal-Boussinesq-Calcolo2018](https://github.com/javieralmonacid/A01-MixedPrimal-Boussinesq-Calcolo2018). This estimator is capable of detecting zones where local refinement can be applied to improve the accuracy of the solution in a cheap way.
